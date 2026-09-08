@@ -1,0 +1,4 @@
+name: automation-lab-marketplace
+version: 0.1.0
+description: "Browse, install and update Automation Lab capability plugins inside Hermes Desktop."
+author: "Carl Taylor, Automation Agency"

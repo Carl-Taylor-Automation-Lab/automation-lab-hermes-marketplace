@@ -1,0 +1,10 @@
+{
+  "name": "automation-lab-marketplace",
+  "label": "Automation Lab Marketplace",
+  "description": "Private Automation Lab capability catalogue",
+  "icon": "Package",
+  "version": "0.1.0",
+  "tab": {"hidden": true},
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
