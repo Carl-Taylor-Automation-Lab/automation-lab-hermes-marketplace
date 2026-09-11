@@ -52,18 +52,21 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", args.tree):
         parser.error("--tree must be the exact package tree SHA")
-    original = plugins_cmd._read_manifest_for_install
+    reader_name = ("_read_manifest_for_install"
+                   if hasattr(plugins_cmd, "_read_manifest_for_install") else "_read_manifest")
+    original_read = getattr(plugins_cmd, reader_name)
     def read(directory):
+        prepare_manifest(directory, args.name)
+        return original_read(directory)
+    # Hermes 0.21.0 handled this inline; newer builds expose a dedicated seam.
+    setattr(plugins_cmd, reader_name, read)
+    original_scan = plugins_cmd._scan_plugin_tree
+    def scan(directory, *positional, **options):
         prepare_manifest(directory, args.name)
         with (directory / ".marketplace-tree.json").open("x", encoding="utf-8") as stream:
             json.dump({"tree_sha": args.tree}, stream)
-        return original(directory)
-    # Process-local adapter at the pre-scan seam; never patches the installed runtime.
-    plugins_cmd._read_manifest_for_install = read
-    original_scan = plugins_cmd._scan_plugin_tree
-    def scan(*positional, **options):
         try:
-            return original_scan(*positional, **options)
+            return original_scan(directory, *positional, **options)
         except plugins_cmd.PluginScanBlocked as error:
             if args.scan_report and error.scan_result is not None:
                 with Path(args.scan_report).open("x", encoding="utf-8") as stream:
