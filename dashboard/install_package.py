@@ -5,10 +5,13 @@ Original Claude/Codex files and upstream repositories are never modified.
 """
 import argparse
 import json
+import os
 import re
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
-from plugin_api import _bounded_json
+from plugin_api import MARKETPLACES, _bounded_json
 
 
 def prepare_manifest(directory: Path, expected_name: str) -> None:
@@ -39,7 +42,13 @@ def prepare_manifest(directory: Path, expected_name: str) -> None:
 
 
 def main():
-    from hermes_cli import plugins_cmd
+    # ponytail: transport the credential through stdin, never a child-inspectable
+    # launch environment. Git alone receives an origin-scoped header.
+    token = sys.stdin.readline().rstrip("\n")
+    if not token or "\r" in token:
+        raise RuntimeError("Marketplace Git credential is missing or invalid")
+    sys.stdin = open(os.devnull, "r", encoding="utf-8")
+    from hermes_cli import git_credentials, plugins_cmd
     parser = argparse.ArgumentParser()
     parser.add_argument("identifier")
     parser.add_argument("--name", required=True)
@@ -60,6 +69,10 @@ def main():
         return original_read(directory)
     # Hermes 0.21.0 handled this inline; newer builds expose a dedicated seam.
     setattr(plugins_cmd, reader_name, read)
+    # Current Hermes resolves the reader in its installer module, not the facade.
+    install_module = sys.modules.get("hermes_cli.plugins_cmd_install")
+    if install_module and hasattr(install_module, "_read_manifest_for_install"):
+        setattr(install_module, "_read_manifest_for_install", read)
     original_scan = plugins_cmd._scan_plugin_tree
     def scan(directory, *positional, **options):
         prepare_manifest(directory, args.name)
@@ -73,8 +86,14 @@ def main():
                     json.dump({"verdict": error.scan_result.verdict}, stream)
             raise
     plugins_cmd._scan_plugin_tree = scan
-    plugins_cmd.cmd_install(args.identifier, force=args.force,
-                            enable=args.enable and not args.no_enable, ref=args.ref)
+    allowed = {f"https://github.com/{market['repo']}.git" for market in MARKETPLACES.values()}
+    def scoped_credentials(url):
+        if url in allowed:
+            yield "Automation Lab OAuth", ("x-access-token", token)
+    # ponytail: stock Git stays origin-scoped; no fallback to the member's broader gh login.
+    with patch.object(git_credentials, "iter_git_basic_auth", scoped_credentials):
+        plugins_cmd.cmd_install(args.identifier, force=args.force,
+                                enable=args.enable and not args.no_enable, ref=args.ref)
 
 
 if __name__ == "__main__":
