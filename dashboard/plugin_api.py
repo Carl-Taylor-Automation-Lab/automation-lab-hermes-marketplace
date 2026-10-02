@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -407,38 +408,32 @@ def _access_token() -> str:
 def _askpass(token: str):
     directory = Path(tempfile.mkdtemp(prefix="automation-lab-askpass-"))
     try:
-        if os.name == "nt":
-            helper = directory / "askpass.cmd"
-            helper.write_text(
-                "@echo off\r\n"
-                "echo %~1 | findstr /I username >nul\r\n"
-                "if %errorlevel%==0 (echo x-access-token) else (echo %AUTOMATION_LAB_GITHUB_TOKEN%)\r\n",
-                encoding="utf-8",
-            )
-        else:
-            helper = directory / "askpass.sh"
-            helper.write_text(
-                "#!/bin/sh\ncase \"$1\" in *sername*) printf '%s\\n' x-access-token ;; "
-                "*) printf '%s\\n' \"$AUTOMATION_LAB_GITHUB_TOKEN\" ;; esac\n",
-                encoding="utf-8",
-            )
-            helper.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        _secure_path(directory, directory=True)
+        token_file = directory / "credential"
+        with token_file.open("x", encoding="utf-8") as stream:
+            # ponytail: Git's native credential-store matches the HTTPS host; no prompt parser.
+            stream.write(f"https://x-access-token:{urllib.parse.quote(token, safe='')}@github.com\n")
+        _secure_path(token_file)
+        quoted_file = (subprocess.list2cmdline([str(token_file)]) if os.name == "nt"
+                       else shlex.quote(str(token_file)))
         # Git accepts config, rewrites, tracing, alternate object stores and
         # executable helpers through many GIT_* variables. Inherit none of them.
         env = {k: v for k, v in os.environ.items()
-               if not k.upper().startswith(("GIT_", "GCM_"))}
+               if not k.upper().startswith(("GIT_", "GCM_"))
+               and k.upper() not in ("GITHUB_TOKEN", "GH_TOKEN")}
         env.update(
             {
-                "AUTOMATION_LAB_GITHUB_TOKEN": token,
-                "GIT_ASKPASS": str(helper),
+                "AUTOMATION_LAB_GITHUB_TOKEN_FILE": str(token_file),
                 "GIT_TERMINAL_PROMPT": "0",
                 "GCM_INTERACTIVE": "Never",
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_COUNT": "2",
                 "GIT_CONFIG_KEY_0": "credential.helper",
                 "GIT_CONFIG_VALUE_0": "",
+                "GIT_CONFIG_KEY_1": "credential.helper",
+                "GIT_CONFIG_VALUE_1": f"store --file={quoted_file}",
                 "GIT_ALLOW_PROTOCOL": "https",
                 "GIT_CEILING_DIRECTORIES": str(directory.parent),
                 "GIT_TEMPLATE_DIR": str(directory / "empty-template"),
@@ -509,6 +504,7 @@ def _run(
     env: dict[str, str],
     timeout: int = 180,
     cwd: Path | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     creationflags = 0
     popen_kwargs: dict[str, Any] = {}
@@ -524,7 +520,7 @@ def _run(
             text=True,
             encoding="utf-8",
             errors="replace",
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             env=env,
             cwd=str(cwd) if cwd else tempfile.gettempdir(),
             creationflags=creationflags,
@@ -538,7 +534,7 @@ def _run(
             process.wait(timeout=5)
             raise
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
         except subprocess.TimeoutExpired:
             if job:
                 job[1].TerminateJobObject(job[0], 1)
@@ -918,12 +914,15 @@ def _install_plugin(body: dict[str, Any]) -> dict[str, Any]:
         args.append("--enable" if enable and not existing else "--no-enable")
         try:
             with _askpass(token) as env:
+                Path(env["AUTOMATION_LAB_GITHUB_TOKEN_FILE"]).unlink()
+                installer_env = {k: v for k, v in env.items()
+                                 if k not in ("AUTOMATION_LAB_GITHUB_TOKEN_FILE", "GIT_ASKPASS")}
                 scan_home = Path(tempfile.mkdtemp(prefix="automation-lab-scan-")).resolve()
                 try:
                     scan_args = [part for part in args if part != "--force" or reviewed]
                     scan_args.extend(["--scan-report", str(scan_home / "scan-result.json")])
-                    scan_env = dict(env, HERMES_HOME=str(scan_home))
-                    scan = _run(scan_args, env=scan_env, timeout=240)
+                    scan_env = dict(installer_env, HERMES_HOME=str(scan_home))
+                    scan = _run(scan_args, env=scan_env, timeout=240, input_text=token + "\n")
                     scan_report = _read_json(scan_home / "scan-result.json", {})
                 finally:
                     shutil.rmtree(scan_home, ignore_errors=True)
@@ -938,7 +937,7 @@ def _install_plugin(body: dict[str, Any]) -> dict[str, Any]:
                 if (_metadata().get(name) != original_record
                         or (plugin_dir.stat().st_ino if plugin_dir.exists() else None) != original_inode):
                     raise HTTPException(409, "Plugin changed in another surface during validation; retry")
-                result = _run(args, env=env, timeout=240)
+                result = _run(args, env=installer_env, timeout=240, input_text=token + "\n")
         except subprocess.TimeoutExpired as exc:
             raise HTTPException(504, "Plugin installation timed out") from exc
         output = ((result.stdout or "") + "\n" + (result.stderr or "")).replace(token, "[REDACTED]")[-4000:]
